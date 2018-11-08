@@ -74,6 +74,7 @@ typedef SOCKET mtcp_socket_t;
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <signal.h>
 typedef int mtcp_socket_t;
 #define mtcp_invalid_socket -1
 
@@ -331,10 +332,10 @@ namespace mtcp
                 buf.resize(1024);
 #if (defined MTCP_OS_WINDOWS)
                 memset(this, 0, sizeof(OVERLAPPED));
-                address.resize(sizeof(sockaddr_in));
                 WSABuf.buf = (CHAR*)buf.data();
                 WSABuf.len = (ULONG)buf.size();
 #endif
+                address.resize(sizeof(sockaddr_in));
             }
 
             void flush(size_t len) {
@@ -346,8 +347,8 @@ namespace mtcp
 
 #if (defined MTCP_OS_WINDOWS)
             WSABUF WSABuf;
-            string address;
 #endif
+            string address;
             peer_t *peer;
         };
 
@@ -373,6 +374,7 @@ namespace mtcp
 
             virtual void async_recv()
             {
+ #if (defined MTCP_OS_WINDOWS)
                 DWORD bytes = 0;
                 DWORD flags = 0;
                 int addr_len = (int)recv_ctx.address.size();
@@ -386,10 +388,15 @@ namespace mtcp
                     if (socket::get_error() != WSA_IO_PENDING)
                         std::cout << socket::get_error() << endl;
                 }
+#elif defined MTCP_OS_LINUX
+           
+#endif
+
             }
 
             virtual void async_send(const string &addr, const char *data, size_t len, bool flush = true)
             {
+ #if (defined MTCP_OS_WINDOWS)
                 if (len == 0)
                     return;
 
@@ -405,9 +412,14 @@ namespace mtcp
                         std::cout << socket::get_error() << endl;
                     }
                 }
+#elif defined MTCP_OS_LINUX
+           
+#endif                
+
             }
 
         private:
+#if (defined MTCP_OS_WINDOWS)  
             context * pop_send_ctx() {
                 static const size_t chunk = 32;
                 if (idle_pool.empty())
@@ -433,6 +445,7 @@ namespace mtcp
             void push_send_ctx(context *ctx) {
                 idle_pool.push_front(ctx);
             }
+#endif 
         protected:
             string name;
             mtcp_socket_t fd = mtcp_invalid_socket;
@@ -514,7 +527,7 @@ namespace mtcp
 #else
                 struct sigaction action;
                 action.sa_flags = 0;
-                action.sa_handler = shine_handle_pipe;
+                action.sa_handler = mtcp_handle_pipe;
 
                 sigaction(SIGPIPE, &action, NULL);
 
@@ -525,7 +538,7 @@ namespace mtcp
 
                     struct epoll_event event_arr[max_event_size];
 
-                    int num = epoll_wait(_epoll_fd, event_arr, max_event_size, timeout > 0 ? timeout : 1000);
+                    int num = epoll_wait(_kernel, event_arr, max_event_size, timeout > 0 ? timeout : 1000);
 
                     for (int i = 0; i < num; i++)
                     {
@@ -533,6 +546,7 @@ namespace mtcp
                         peer_t *peer = (peer_t*)ee.data.ptr;
 
                         if (ee.events & (EPOLLERR | EPOLLHUP))
+                        ;
                             //peer->close();
                         else
                         {
@@ -540,12 +554,15 @@ namespace mtcp
                             {
                                 for (;;)
                                 {
-                                    int addr_len = peer->recv_ctx.address.size();
-                                    int recv_len = recvfrom(peer->fd, peer->recv_ctx.buf.data(), peer->recv_ctx.buf.size(), (struct sockaddr*)peer->recv_ctx.address, &addr_len);
-
+                                    socklen_t addr_len = peer->recv_ctx.address.size();
+                                    
+                                    int recv_len = ::recvfrom(peer->fd, (void*)peer->recv_ctx.buf.data(), peer->recv_ctx.buf.size(), 0, (struct sockaddr*)peer->recv_ctx.address.data(), &addr_len);
+                                    
                                     if (recv_len > 0)
                                     {
-
+                                        
+                                        ::sendto(peer->fd, peer->recv_ctx.buf.data(), recv_len, 0, (struct sockaddr*)peer->recv_ctx.address.data(), addr_len);
+                                        
                                     }
                                     else if (recv_len < 0)
                                     {
@@ -554,9 +571,12 @@ namespace mtcp
                                         {
                                             //close();
                                         }
+
+                                        break;
                                     }
                                     else if (recv_len == 0)
                                     {
+                                        break;
                                         //close();
                                     }
                                 }
@@ -572,9 +592,13 @@ namespace mtcp
             }
 
             bool add_peer(bool server, const string &name, const string &addr, peer_callback_t cb){
+#ifdef MTCP_OS_WINDOWS
                 if (_kernel == nullptr)
                     return false;
-
+#elif defined MTCP_OS_LINUX
+                if (_kernel == mtcp_invalid_socket)
+                    return false;
+#endif
                 address_info_t info;
                 if (!socket::parse_addr(addr, info))
                     return false;
@@ -638,7 +662,7 @@ namespace mtcp
 
         private:
 #ifdef MTCP_OS_WINDOWS
-            HANDLE _kernel;///<Íê³É¶Ë¿Ú¾ä±ú
+            HANDLE _kernel = nullptr;///iocp
 #elif defined MTCP_OS_LINUX
             mtcp_socket_t _kernel;//epoll fd
 #endif
