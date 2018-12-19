@@ -7,7 +7,7 @@ INCLUDE_DIRECTORIES(
 )
 
 IF(NOT WIN32)
- SET(CMAKE_CXX_FLAGS "-std=c++11 -Wall")
+ SET(CMAKE_CXX_FLAGS "-std=c++11 -Wall -O3")
 
 ENDIF()
 
