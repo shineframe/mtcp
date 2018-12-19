@@ -825,8 +825,8 @@ namespace mtcp
 
                 flush();
 
-//                 if (ts - send_timestamp > timeout) ;
-                    //send_heartbeat();
+                if (ts - send_timestamp > timeout)
+                    send_heartbeat();
 
                 return true;
             }
