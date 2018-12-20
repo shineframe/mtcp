@@ -109,7 +109,7 @@ namespace mtcp
 
     class callback_t{
     public:
-        virtual bool on_active(session_t* session) { return true; }
+        virtual bool on_open(session_t* session) { return true; }
         virtual bool on_recv(session_t* session, unsigned int sequence, const char *data, std::size_t len) { return true; }
         virtual bool on_send(session_t* session, unsigned int sequence, int result, std::size_t cost_time) { return true; }
         virtual bool on_timeout(session_t* session) { return false; }
@@ -182,39 +182,45 @@ namespace mtcp
 
 #pragma pack(push, 1)
         struct header_t{
+            header_t(){
+                memset(&flags, 0, sizeof(flags));
+            }
+            enum {
+                e_sync = 1 << 7,
+                e_push = 1 << 6,
+                e_begin = 1 << 5,
+                e_end = 1 << 4,
+                e_ack = 1 << 3,
+                e_sack = 1 << 2,
+                e_heart = 1 << 1,
+                e_fin = 1,
+            };
+
             void hton(){
                 seq = htonl(seq);
                 group = htonl(group);
-//                 count = htonl(count);
-//                 crc = htons(crc);
-                mask.value = htons(mask.value);
+                token = htons(token);
             }
 
             void ntoh(){
                 seq = ntohl(seq);
                 group = ntohl(group);
-//                 count = ntohl(count);
-//                 crc = ntohs(crc);
-                mask.value = ntohs(mask.value);
+                token = ntohs(token);
             }
 
-            union {
-                struct {
-                    unsigned short push : 1;
-                    unsigned short begin : 1;
-                    unsigned short end : 1;
-                    unsigned short ack : 1;
-                    unsigned short s_ack : 1;
-                    unsigned short heartbeat : 1;
-                    unsigned short token : 10;
-                } flags;
-                unsigned short value = 0;
-            } mask;
-//             unsigned short crc = 0;
+            struct {
+                unsigned char sync : 1;
+                unsigned char push : 1;
+                unsigned char begin : 1;
+                unsigned char end : 1;
+                unsigned char ack : 1;
+                unsigned char s_ack : 1;
+                unsigned char heartbeat : 1;
+                unsigned char fin : 1;
+            } flags;
+            unsigned short token = 0;
             unsigned int seq = 0;
             unsigned int group = 0;
-//             unsigned int count = 0;
-//             unsigned int ack = 0;
         };
 #pragma pack(pop)
 
@@ -223,7 +229,7 @@ namespace mtcp
         public:
             message_t(unsigned int token){
                 data_.resize(sizeof(header_t));
-                head.mask.flags.token = token;
+                head.token = token;
             }
 
             bool operator <(const message_t &other){
@@ -795,25 +801,30 @@ namespace mtcp
             }
             ~session_t(){}
 
+            const address_info_t & get_local_addr(){
+                return local_addr_info;
+            }
+
+            const address_info_t & get_remote_addr(){
+                return remote_addr_info;
+            }
+
             bool on_timer(){
                 std::size_t ts = get_timestamp();
 
-                if (ts - recv_timestamp > timeout * protocol::e_rtoc)
+                if (recv_timestamp && ts - recv_timestamp > timeout * protocol::e_rtoc)
                 {
                     bool rc = callback->on_timeout(this);
 
                     if (!rc)
                     {
-
+                        close();
+                        return false;
                     }
-#ifdef MTCP_OS_WINDOWS
-                    if (type == e_client)
+                    else
                     {
-                        closesocket(fd);
+                        recv_timestamp = ts;
                     }
-#endif // MTCP_OS_WINDOWS
-//                     delay_close_queue->push_back(this);
-                    return false;
                 }
 
                 if (!wait_ack_set.empty()) {
@@ -825,7 +836,7 @@ namespace mtcp
 
                 flush();
 
-                if (ts - send_timestamp > timeout)
+                if (recv_timestamp && ts - send_timestamp > timeout)
                     send_heartbeat();
 
                 return true;
@@ -848,12 +859,13 @@ namespace mtcp
                     protocol::message_t * message = new protocol::message_t(local_token);
                     std::size_t cost = (len > pos + protocol::e_mss) ? protocol::e_mss : (len - pos);
                     message->head.group = req_seq;
-                    message->head.mask.flags.begin = pos == 0 ? 1 : 0;
-                    message->head.mask.flags.end = (len <= pos + protocol::e_mss) ? 1 : 0;
-                    message->head.mask.flags.push = 1;
-                    message->head.mask.flags.ack = 0;
-                    message->head.mask.flags.s_ack = 0;
-                    message->head.mask.flags.heartbeat = 0;
+                    message->head.flags.begin = pos == 0 ? 1 : 0;
+                    message->head.flags.end = (len <= pos + protocol::e_mss) ? 1 : 0;
+                    message->head.flags.push = 1;
+                    message->head.flags.ack = 0;
+                    message->head.flags.s_ack = 0;
+                    message->head.flags.heartbeat = 0;
+                    message->head.flags.fin = 0;
                     message->head.seq = ++seq;
                     message->assign(data + pos, cost);
                     message->encode();
@@ -872,29 +884,27 @@ namespace mtcp
                 return req_seq;
             }
 
-            void close() {
-                if (type == e_client)
-                {
-                    socket::close(fd);
-                }
-                reset();
+            void close(){
+                close(true);
             }
-
-            void send_active(){
-                protocol::message_t * message = new protocol::message_t(local_token);
-                message->head.seq = seq;
-                message->encode();
-                send(message);
-
-                wait_ack_set.emplace(std::move(message));
-            }
-
 
         private:
-            void reset(){
-                if (remote_token != 0)
-                    callback->on_close(this);
+            void close(bool local) {
+                reset();
 
+                if (local)
+                {
+                    for (int i = 0; i < 3; i++)
+                        send_fin();
+                }
+
+                if (type == e_client)
+                    socket::close(fd);
+                else
+                    callback->on_close(this);
+            }
+
+            void reset(){
                 seq = 0;
                 req_sequence = 0;
                 remote_commit_seq = 0;
@@ -916,14 +926,14 @@ namespace mtcp
             }
 
             void on_recv(protocol::message_t * message){
-                if (message->head.mask.flags.ack || message->head.mask.flags.s_ack) {
+                if (message->head.flags.ack || message->head.flags.s_ack) {
                     on_ack(message);
                     delete message;
                     return;
                 }
 
                 //std::cout << message->head.seq << std::endl;    
-                if (message->head.mask.flags.push)
+                if (message->head.flags.push)
                 {
 //                     send_ack(message->head.seq, message->head.group);
 //                     return; 
@@ -944,7 +954,7 @@ namespace mtcp
                             }
                         }
                         else{
-                            if (message->head.mask.flags.begin && message->head.mask.flags.end 
+                            if (message->head.flags.begin && message->head.flags.end 
                                 && message->head.seq == remote_commit_seq + 1)
                             {
                                 remote_commit_seq = message->head.seq;
@@ -990,7 +1000,7 @@ namespace mtcp
 
             void on_ack(protocol::message_t * message){
 
-                if (message->head.mask.flags.s_ack) {
+                if (message->head.flags.s_ack) {
                     while (wait_ack_set.size() > 0 && 
                     ((*(*wait_ack_set.begin())) < (*message) || (*(*wait_ack_set.begin())) == (*message))){
                         check_sequence_count((*wait_ack_set.begin())->head.group);
@@ -1034,7 +1044,7 @@ namespace mtcp
                 protocol::header_t &begin = (*group.begin())->head;
                 protocol::header_t &end = (*group.rbegin())->head;
 
-                if (!(begin.mask.flags.begin && end.mask.flags.end && (begin.seq + group.size() - 1) == end.seq))
+                if (!(begin.flags.begin && end.flags.end && (begin.seq + group.size() - 1) == end.seq))
                     return rc;
 
                 std::string data;
@@ -1064,14 +1074,25 @@ namespace mtcp
                 send_timestamp = message->timestamp;
             }
 
+            void send_sync(){
+                protocol::message_t * message = new protocol::message_t(local_token);
+                message->head.flags.sync = 1;
+                message->encode();
+                send(message);
+
+                wait_ack_set.emplace(std::move(message));
+            }
+
             void send_heartbeat(){
                 protocol::message_t message(local_token);
-                message.head.seq = 0;
-                message.head.group = 0;
-                message.head.mask.flags.ack = 0;
-                message.head.mask.flags.s_ack = 0;
-                message.head.mask.flags.push = 0;
-                message.head.mask.flags.heartbeat = 1;
+                message.head.flags.heartbeat = 1;
+                message.encode();
+                send(&message);
+            }
+
+            void send_fin(){
+                protocol::message_t message(local_token);
+                message.head.flags.fin = 1;
                 message.encode();
                 send(&message);
             }
@@ -1087,16 +1108,10 @@ namespace mtcp
                 protocol::message_t message(local_token);
                 message.head.seq = seq;
                 message.head.group = group;
-                if (s_ack){
-                    message.head.mask.flags.ack = 0;
-                    message.head.mask.flags.s_ack = 1;
-                }
-                else{
-                    message.head.mask.flags.ack = 1;
-                    message.head.mask.flags.s_ack = 0;
-                }
-                message.head.mask.flags.push = 0;
-                message.head.mask.flags.heartbeat = 0;
+                if (s_ack)
+                    message.head.flags.s_ack = 1;
+                else
+                    message.head.flags.ack = 1;
                 message.encode();
                 send(&message);
             }
@@ -1109,6 +1124,8 @@ namespace mtcp
             int status = protocol::e_close;
             unsigned int local_token = 0;
             unsigned int remote_token = 0;
+            address_info_t local_addr_info;
+            address_info_t remote_addr_info;
             std::string remote_address;
             mtcp_socket_t fd = mtcp_invalid_socket;
             peer_t *peer = nullptr;
@@ -1171,6 +1188,7 @@ namespace mtcp
                 if (type == session_t::e_server) {
                     for (auto iter : *server_sessions.get())
                     {
+                        timer->cancel_timer(iter.second->timer_id);
                         iter.second->reset();
                         delete iter.second.get();
                     }
@@ -1178,6 +1196,8 @@ namespace mtcp
                     server_sessions.reset();
                 }
                 else{
+                    timer->cancel_timer(client_session->timer_id);
+                    client_session->callback->on_close(client_session.get());
                     client_session->reset();
                     client_session.reset();
                 }
@@ -1196,6 +1216,9 @@ namespace mtcp
                 if (type == session_t::e_server) {
                     auto iter = server_sessions->find(addr);
                     if (iter == server_sessions->end()) {
+                        if (!message->head.flags.sync)
+                            return;
+
                         shared_ptr<session_t> sess = std::make_shared<session_t>(token, callback);
                         sess->peer = this;
                         sess->delay_close_queue = delay_close_queue;
@@ -1203,6 +1226,10 @@ namespace mtcp
                         session = sess.get();
                         session->timer_id = timer->set_timer(50, std::bind(&session_t::on_timer, session));
                         session->remote_address = addr;
+                        socket::get_local_addr(fd, session->local_addr_info);
+                        sockaddr_in *sa = (sockaddr_in*)addr.data();
+                        session->remote_addr_info.ip = inet_ntoa(sa->sin_addr);
+                        session->remote_addr_info.port = ntohs(sa->sin_port);
                         server_sessions->emplace(addr, std::move(sess));
                     }
                     else{
@@ -1218,15 +1245,32 @@ namespace mtcp
 
                 session->recv_timestamp = message->timestamp;
 
-                if (session->remote_token != message->head.mask.flags.token)
+                if (message->head.flags.sync && session->remote_token != message->head.token)
                 {
                     session->reset();
-                    session->remote_token = message->head.mask.flags.token;
-                    session->peer->callback->on_active(session);
+                    session->remote_token = message->head.token;
+                    session->peer->callback->on_open(session);
                     if (type == session_t::e_server)
-                        session->send_active();
+                        session->send_sync();
                     return;
                 }
+                
+                if (message->head.flags.fin)
+                {
+                    session->peer->callback->on_close(session);
+                    if (type == session_t::e_server){
+                        server_sessions->erase(addr);
+                        session->close(false);
+                        delete session;
+                    }
+                    else
+                    {
+                        session->close(false);
+                    }
+                    return;
+                }
+
+
 
                 session->on_recv(message);
             }
@@ -1280,11 +1324,6 @@ namespace mtcp
                         return close_all();
 
                     DWORD timeout = (DWORD)_timer_manager.do_timer();
-
-                    for (session_t *sess : _delay_close_queue){
-                        sess->close();
-                        delete sess;
-                    }
 
                     void *key = nullptr;
                     context *ctx = nullptr;
@@ -1478,11 +1517,13 @@ namespace mtcp
                     if (!socket::connect(fd, (struct sockaddr*)sock))
                         socket::dump_error();
 
+                    peer->client_session->local_addr_info = local_info;
+                    peer->client_session->remote_addr_info = remote_info;
                     peer->client_session->remote_address = peer->recv_ctx.address;
                     if (!local_addr.empty() && !socket::bind(fd, local_addr))
                         goto ON_FAILED;
 
-                    peer->client_session->send_active();
+                    peer->client_session->send_sync();
 //                     peer->active_callback(peer->client_session.get());
                 }
 
